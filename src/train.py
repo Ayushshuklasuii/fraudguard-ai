@@ -1,6 +1,8 @@
 """FraudGuard AI v2.0 - src/train.py
 Trains a fraud model on the IEEE-CIS Fraud Detection data.
 
+Feature code now lives in src/features.py (shared with scoring.py).
+
 Steps:
   1. Load only the columns we need and join transaction + identity tables
   2. Sort by time and add point-in-time card velocity features (past only)
@@ -28,6 +30,17 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+# Shared feature code (also used by scoring.py). Works both when this file is
+# run as a script (python src/train.py) and when it is imported (tests).
+try:
+    from src.features import (CAT_COLS, CARD_KEY, FEATURES, WINDOW_1H,
+                              WINDOW_24H, add_velocity_features, encode,
+                              fit_category_maps)
+except ModuleNotFoundError:
+    from features import (CAT_COLS, CARD_KEY, FEATURES, WINDOW_1H,
+                          WINDOW_24H, add_velocity_features, encode,
+                          fit_category_maps)
+
 # ----------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------
@@ -35,14 +48,6 @@ TX_COLS = ["TransactionID", "isFraud", "TransactionDT", "TransactionAmt",
            "ProductCD", "card1", "card2", "card4", "card6", "addr1",
            "P_emaildomain"]
 ID_COLS = ["TransactionID", "DeviceType"]
-CAT_COLS = ["ProductCD", "card4", "card6", "P_emaildomain", "DeviceType"]
-BASE_FEATURES = ["TransactionAmt", "hour", "has_identity", "ProductCD",
-                 "card1", "card2", "card4", "card6", "addr1",
-                 "P_emaildomain", "DeviceType"]
-VELOCITY_FEATURES = ["cnt_1h", "cnt_24h", "amt_sum_24h", "secs_since_last"]
-FEATURES = BASE_FEATURES + VELOCITY_FEATURES
-
-CARD_KEY = "card1"    # IEEE-CIS has no real card ID; card1 is our best guess
 REVIEW_COST = 5.0     # assumed dollar cost of an analyst reviewing one alert
 SPLIT = (0.70, 0.85)  # train ends at 70%, validation ends at 85%
 
@@ -63,63 +68,6 @@ def load_data(data_dir: Path) -> pd.DataFrame:
     df = df.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
     df["hour"] = (df["TransactionDT"] // 3600) % 24  # approximate hour of day
     return df
-
-
-# ----------------------------------------------------------------------------
-# 2. Point-in-time velocity features
-# For every transaction we look ONLY at earlier transactions of the same
-# card1. Window = [t - window, t). The current transaction is never counted.
-# Use the same windows in Redis later so training and serving match.
-# ----------------------------------------------------------------------------
-def add_velocity_features(df: pd.DataFrame, key: str = CARD_KEY) -> pd.DataFrame:
-    n = len(df)
-    cnt_1h = np.zeros(n)
-    cnt_24h = np.zeros(n)
-    amt_24h = np.zeros(n)
-    since_last = np.full(n, np.nan)
-
-    t_all = df["TransactionDT"].to_numpy(dtype="float64")
-    a_all = df["TransactionAmt"].to_numpy(dtype="float64")
-
-    for idx in df.groupby(key, sort=False).indices.values():
-        idx = np.sort(idx)  # df is time-sorted, so this stays in order
-        t, a = t_all[idx], a_all[idx]
-        cum = np.concatenate(([0.0], np.cumsum(a)))
-
-        right = np.searchsorted(t, t, side="left")           # strictly earlier rows
-        left_1h = np.searchsorted(t, t - 3600, side="left")
-        left_24h = np.searchsorted(t, t - 86400, side="left")
-
-        cnt_1h[idx] = right - left_1h
-        cnt_24h[idx] = right - left_24h
-        amt_24h[idx] = cum[right] - cum[left_24h]
-
-        has_prev = right > 0
-        prev_t = t[np.maximum(right - 1, 0)]
-        since_last[idx[has_prev]] = (t - prev_t)[has_prev]
-
-    out = df.copy()
-    out["cnt_1h"] = cnt_1h
-    out["cnt_24h"] = cnt_24h
-    out["amt_sum_24h"] = amt_24h
-    out["secs_since_last"] = since_last  # NaN = first time we see this card
-    return out
-
-
-# ----------------------------------------------------------------------------
-# 3. Encoding (learned from TRAIN rows only, saved for serving)
-# ----------------------------------------------------------------------------
-def fit_category_maps(train_df: pd.DataFrame) -> dict:
-    return {c: {str(v): i for i, v in
-                enumerate(sorted(train_df[c].dropna().astype(str).unique()))}
-            for c in CAT_COLS}
-
-
-def encode(df: pd.DataFrame, maps: dict) -> pd.DataFrame:
-    X = df[FEATURES].copy()
-    for c in CAT_COLS:
-        X[c] = X[c].map(maps[c]).fillna(-1).astype("int32")  # unseen or missing = -1
-    return X
 
 
 # ----------------------------------------------------------------------------
@@ -262,7 +210,7 @@ def main():
         "category_columns": CAT_COLS,
         "category_maps": maps,
         "card_key": CARD_KEY,
-        "velocity_windows_sec": {"1h": 3600, "24h": 86400},
+        "velocity_windows_sec": {"1h": WINDOW_1H, "24h": WINDOW_24H},
         "thresholds": {"high": high_thr, "medium": medium_thr},
         "review_cost_usd": REVIEW_COST,
         "xgb_params": {k: (float(v) if isinstance(v, (np.floating, float)) else v)
